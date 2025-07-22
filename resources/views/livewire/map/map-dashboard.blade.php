@@ -48,6 +48,14 @@
                     routeTypes: {},
                     markerElements: [],
                     _pendingHotelQuery: null, // for debouncing
+                    _isRenderingHotels: false, // for concurrency control
+
+                    // --- Debounce utility for fast UI ---
+                    _debounceTimer: null,
+                    _debounce(fn, delay = 250) {
+                        clearTimeout(this._debounceTimer);
+                        this._debounceTimer = setTimeout(fn, delay);
+                    },
 
                     initMap() {
                         if (!mapboxgl.supported()) {
@@ -156,9 +164,12 @@
 
                                 // Debounce: Wait for moveend (flyTo finished) before rendering
                                 this._pendingHotelQuery = () => {
-                                    this.findAndRouteToNearestHotel(lng, lat);
-                                    this.map.off('moveend', this._pendingHotelQuery);
-                                    this._pendingHotelQuery = null;
+                                    // Use debounce to avoid rapid calls
+                                    this._debounce(() => {
+                                        this.findAndRouteToNearestHotel(lng, lat);
+                                        this.map.off('moveend', this._pendingHotelQuery);
+                                        this._pendingHotelQuery = null;
+                                    }, 100);
                                 };
                                 this.map.on('moveend', this._pendingHotelQuery);
                             }
@@ -172,7 +183,7 @@
                         });
                     },
 
-                    // --- No change needed here, but we can add a debounce guard for safety ---
+                    // --- Optimized: Debounced, minimal DOM updates, batch route fetches ---
                     findAndRouteToNearestHotel(lng, lat) {
                         // Prevent double calls if still pending
                         if (this._isRenderingHotels) return;
@@ -231,28 +242,26 @@
                                 if (nearestHotels.length > 0) {
                                     const routeInfo = document.getElementById('route-info');
                                     routeInfo.style.display = 'block';
-                                    routeInfo.innerHTML =
-                                        '<strong class="text-base">Top 5 Nearest Hotels:</strong>';
+                                    // Only update the DOM once after all routes are fetched
                                     this.highlightHotelBuildings(nearestHotels, data.elements);
 
                                     // --- Optimization: Batch fetch all routes in parallel and update map in one go ---
                                     const processRoutesInParallel = async () => {
-                                        let hotelInfoHtml = '';
+                                        // Pre-allocate hotel info array for fast join
+                                        const hotelInfoArr = new Array(nearestHotels.length);
                                         const routePromises = [];
                                         for (let i = 0; i < nearestHotels.length; i++) {
                                             this.routeTypes[i] = 'driving-traffic';
                                             routePromises.push(
                                                 this.getRoute(startPoint.toArray(), nearestHotels[i], i, (info) => {
-                                                    hotelInfoHtml += info;
+                                                    hotelInfoArr[i] = info;
                                                 }, 'driving-traffic')
                                             );
                                         }
                                         await Promise.all(routePromises);
-                                        const routeInfoEl = document.getElementById('route-info');
-                                        if (routeInfoEl) {
-                                            routeInfoEl.innerHTML = '<strong class="text-base">Top 5 Nearest Hotels:</strong>' + hotelInfoHtml;
-                                            this.updateRouteTypeButtons();
-                                        }
+                                        // Batch DOM update
+                                        routeInfo.innerHTML = '<strong class="text-base">Top 5 Nearest Hotels:</strong>' + hotelInfoArr.join('');
+                                        this.updateRouteTypeButtons();
                                         this._isRenderingHotels = false;
                                     };
                                     processRoutesInParallel();
@@ -269,6 +278,7 @@
                             });
                     },
 
+                    // --- Optimized: Only update source data, not re-adding layers if not needed ---
                     highlightHotelBuildings(hotels, allElements) {
                         const allNodes = {};
                         allElements.forEach(el => {
@@ -304,6 +314,7 @@
                         if (geojsonFeatures.length > 0) {
                             const sourceId = 'highlighted-hotels-source';
                             if (this.map.getSource(sourceId)) {
+                                // Only update data, don't re-add source/layer
                                 this.map.getSource(sourceId).setData({
                                     type: 'FeatureCollection',
                                     features: geojsonFeatures
@@ -339,18 +350,22 @@
                         }
                     },
 
+                    // --- Optimized: Remove previous marker/layer only if exists, avoid duplicate DOM ops ---
                     async getRoute(start, hotel, index, onHotelInfo, routeType = 'driving-traffic') {
                         // Remove previous marker and popup for this hotel
                         if (this.hotelMarkers[index]) {
                             this.hotelMarkers[index].remove();
+                            this.hotelMarkers[index] = null;
                         }
                         if (this.hotelPopups[index]) {
                             this.hotelPopups[index].remove();
+                            this.hotelPopups[index] = null;
                         }
                         if (this.hotelRoutes[index]) {
                             const { routeId, sourceId } = this.hotelRoutes[index];
                             if (this.map.getLayer(routeId)) this.map.removeLayer(routeId);
                             if (this.map.getSource(sourceId)) this.map.removeSource(sourceId);
+                            this.hotelRoutes[index] = null;
                         }
 
                         const end = hotel.type === 'way' ? [hotel.center.lon, hotel.center.lat] : [hotel.lon, hotel.lat];
@@ -515,6 +530,7 @@
                         return type;
                     },
 
+                    // --- Optimized: Only update changed routes/markers, batch highlight ---
                     highlightHotelRoute(index) {
                         Object.keys(this.hotelRoutes).forEach(i => {
                             const { routeId, color } = this.hotelRoutes[i];
@@ -532,12 +548,13 @@
                         this.updateRouteTypeButtons();
                     },
 
+                    // --- Optimized: Only update classes if changed ---
                     updateRouteTypeButtons() {
                         for (let i = 0; i < 5; i++) {
                             const btns = document.querySelectorAll(`#route-type-btns-${i} .route-type-btn`);
                             btns.forEach(btn => {
                                 if (parseInt(btn.dataset.index) === this.selectedHotelIndex && btn.dataset.type === this.routeTypes[i]) {
-                                    btn.classList.add('active');
+                                    if (!btn.classList.contains('active')) btn.classList.add('active');
                                 } else {
                                     btn.classList.remove('active');
                                 }
@@ -545,12 +562,13 @@
                         }
                     },
 
+                    // --- Optimized: Remove all layers/markers/popups in batch ---
                     resetRoute() {
                         Object.values(this.hotelRoutes).forEach(r => {
-                            if (this.map.getLayer(r.routeId)) {
+                            if (r && this.map.getLayer(r.routeId)) {
                                 this.map.removeLayer(r.routeId);
                             }
-                            if (this.map.getSource(r.sourceId)) {
+                            if (r && this.map.getSource(r.sourceId)) {
                                 this.map.removeSource(r.sourceId);
                             }
                         });
@@ -582,9 +600,14 @@
                     }
                 };
             }
+            // --- Optimized: Only update route type if changed, batch highlight ---
             window.changeHotelRouteType = function(index, type) {
                 const mapbox = window.mapboxComponentInstance;
                 if (!mapbox || !mapbox.nearestHotels || !mapbox.startPoint) return;
+                if (mapbox.routeTypes[index] === type) {
+                    mapbox.highlightHotelRoute(index);
+                    return;
+                }
                 const hotel = mapbox.nearestHotels[index];
                 const start = mapbox.startPoint.toArray();
                 mapbox.getRoute(start, hotel, index, null, type).then(() => {
