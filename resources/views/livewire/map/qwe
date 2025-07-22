@@ -17,8 +17,10 @@
                     Helvetica,
                     sans-serif;
             }
+          
         </style>
         <div class="flex flex-col gap-4 absolute top-5 right-5 z-10">
+
             <button x-on:click="resetMap()" class="bg-red-500 rounded-lg shadow-lg text-black p-2 hover:bg-amber-300">
                 Reset
             </button>
@@ -40,14 +42,13 @@
                     map: null,
                     hotelMarkers: [],
                     hotelPopups: [],
+                    routeLayers: [],
                     highlightedHotelsLayer: null,
                     selectedHotelIndex: null,
-                    hotelRoutes: {},
+                    hotelRoutes: {}, // { [index]: {type, routeId, sourceId, color} }
                     nearestHotels: [],
                     startPoint: null,
-                    routeTypes: {},
-                    markerElements: [],
-                    _pendingHotelQuery: null, // for debouncing
+                    routeTypes: {}, // { [index]: 'driving-traffic' | 'walking' | 'cycling' }
 
                     initMap() {
                         if (!mapboxgl.supported()) {
@@ -66,6 +67,7 @@
                             antialias: true
                         });
 
+                        // Expose this Alpine instance globally for external access
                         window.mapboxComponentInstance = this;
 
                         this.map.on('style.load', () => {
@@ -121,6 +123,7 @@
                                     draggable: true,
                                     anchor: 'bottom'
                                 })
+                                // Center of baguio 
                                 .setLngLat([120.5976, 16.4023])
                                 .addTo(this.map);
 
@@ -130,54 +133,36 @@
 
                             const coordinates = document.getElementById('coordinates');
 
-                            // --- OPTIMIZED: Only render hotels/routes after flyTo/zoom is finished ---
                             function setMarkerAndFlyTo(lng, lat, zoomLevel = 14) {
                                 marker.setLngLat([lng, lat]);
-                                coordinates.style.display = 'block';
-                                coordinates.innerHTML = `Longitude: ${toFourDecimalPlaces(lng)}<br />Latitude: ${toFourDecimalPlaces(lat)}`;
-                                setTimeout(() => {
-                                    coordinates.style.display = 'none';
-                                }, 5000);
 
-                                // Remove any pending hotel query
-                                if (this._pendingHotelQuery) {
-                                    this.map.off('moveend', this._pendingHotelQuery);
-                                    this._pendingHotelQuery = null;
-                                }
-
-                                // Only render hotels/routes after flyTo/zoom is finished
-                                this.map.flyTo({
+                                marker._map.flyTo({
                                     center: [lng, lat],
                                     zoom: zoomLevel,
                                     speed: 0.5,
                                     curve: 1.42,
                                     essential: true
                                 });
-
-                                // Debounce: Wait for moveend (flyTo finished) before rendering
-                                this._pendingHotelQuery = () => {
-                                    this.findAndRouteToNearestHotel(lng, lat);
-                                    this.map.off('moveend', this._pendingHotelQuery);
-                                    this._pendingHotelQuery = null;
-                                };
-                                this.map.on('moveend', this._pendingHotelQuery);
+                                // Show coordinates
+                                coordinates.style.display = 'block';
+                                coordinates.innerHTML = `Longitude: ${toFourDecimalPlaces(lng)}<br />Latitude: ${toFourDecimalPlaces(lat)}`;
+                                setTimeout(() => {
+                                    coordinates.style.display = 'none';
+                                }, 5000);
                             }
 
                             function onDragEnd() {
                                 const lngLat = marker.getLngLat();
-                                setMarkerAndFlyTo.call(this, lngLat.lng, lngLat.lat, 17);
+                                // Fly and zoom in to level 17 when marker is set
+                                setMarkerAndFlyTo(lngLat.lng, lngLat.lat, 17);
+                                this.findAndRouteToNearestHotel(lngLat.lng, lngLat.lat);
                             }
 
                             marker.on('dragend', onDragEnd.bind(this));
                         });
                     },
 
-                    // --- No change needed here, but we can add a debounce guard for safety ---
                     findAndRouteToNearestHotel(lng, lat) {
-                        // Prevent double calls if still pending
-                        if (this._isRenderingHotels) return;
-                        this._isRenderingHotels = true;
-
                         this.resetRoute();
                         const radius = 1000; // 1km
                         const overpassQuery =
@@ -199,7 +184,6 @@
                             .then(data => {
                                 if (data.elements.length === 0) {
                                     alert('No hotels found within 1km.');
-                                    this._isRenderingHotels = false;
                                     return;
                                 }
 
@@ -226,7 +210,7 @@
                                 hotelsWithDistances.sort((a, b) => a.distance - b.distance);
                                 const nearestHotels = hotelsWithDistances.slice(0, 5);
                                 this.nearestHotels = nearestHotels;
-                                this.routeTypes = {};
+                                this.routeTypes = {}; // reset route types
 
                                 if (nearestHotels.length > 0) {
                                     const routeInfo = document.getElementById('route-info');
@@ -234,30 +218,24 @@
                                     routeInfo.innerHTML =
                                         '<strong class="text-base">Top 5 Nearest Hotels:</strong>';
                                     this.highlightHotelBuildings(nearestHotels, data.elements);
-
-                                    // --- Optimization: Batch fetch all routes in parallel and update map in one go ---
-                                    const processRoutesInParallel = async () => {
+                                    // Sequentially process routes for each hotel
+                                    const processRoutesSequentially = async () => {
                                         let hotelInfoHtml = '';
-                                        const routePromises = [];
                                         for (let i = 0; i < nearestHotels.length; i++) {
+                                            // Default to driving-traffic
                                             this.routeTypes[i] = 'driving-traffic';
-                                            routePromises.push(
-                                                this.getRoute(startPoint.toArray(), nearestHotels[i], i, (info) => {
-                                                    hotelInfoHtml += info;
-                                                }, 'driving-traffic')
-                                            );
+                                            await this.getRoute(startPoint.toArray(), nearestHotels[i], i, (info) => {
+                                                hotelInfoHtml += info;
+                                            }, 'driving-traffic');
                                         }
-                                        await Promise.all(routePromises);
+                                        // Batch update DOM after all routes processed
                                         const routeInfoEl = document.getElementById('route-info');
                                         if (routeInfoEl) {
                                             routeInfoEl.innerHTML = '<strong class="text-base">Top 5 Nearest Hotels:</strong>' + hotelInfoHtml;
                                             this.updateRouteTypeButtons();
                                         }
-                                        this._isRenderingHotels = false;
                                     };
-                                    processRoutesInParallel();
-                                } else {
-                                    this._isRenderingHotels = false;
+                                    processRoutesSequentially();
                                 }
                             })
                             .catch(error => {
@@ -265,7 +243,6 @@
                                 alert(
                                     'Could not fetch hotel data. The Overpass API might be busy. Please try again in a moment.'
                                 );
-                                this._isRenderingHotels = false;
                             });
                     },
 
@@ -340,19 +317,12 @@
                     },
 
                     async getRoute(start, hotel, index, onHotelInfo, routeType = 'driving-traffic') {
-                        // Remove previous marker and popup for this hotel
-                        if (this.hotelMarkers[index]) {
-                            this.hotelMarkers[index].remove();
-                        }
-                        if (this.hotelPopups[index]) {
-                            this.hotelPopups[index].remove();
-                        }
+                        // Remove previous route for this hotel if exists
                         if (this.hotelRoutes[index]) {
                             const { routeId, sourceId } = this.hotelRoutes[index];
                             if (this.map.getLayer(routeId)) this.map.removeLayer(routeId);
                             if (this.map.getSource(sourceId)) this.map.removeSource(sourceId);
                         }
-
                         const end = hotel.type === 'way' ? [hotel.center.lon, hotel.center.lat] : [hotel.lon, hotel.lat];
                         const hotelName = hotel.tags.name || `Hotel #${index + 1}`;
                         const routeColors = ['#FFD700', '#FF5733', '#33FF57', '#3357FF', '#FF33A1'];
@@ -371,7 +341,6 @@
                             const duration = routeData.routes[0].duration;
                             const routeId = `route-${index}`;
                             const routeSourceId = `route-source-${index}`;
-                            // Add route as a layer
                             this.map.addSource(routeSourceId, {
                                 type: 'geojson',
                                 data: {
@@ -402,26 +371,23 @@
                             };
                             this.routeTypes[index] = routeType;
 
-                            // --- Retain custom number marker (circle) for each hotel ---
-                            const markerEl = document.createElement('div');
-                            markerEl.style.backgroundColor = color;
-                            markerEl.style.width = '28px';
-                            markerEl.style.height = '28px';
-                            markerEl.style.borderRadius = '50%';
-                            markerEl.style.border = '2px solid white';
-                            markerEl.style.color = 'white';
-                            markerEl.style.textAlign = 'center';
-                            markerEl.style.lineHeight = '24px';
-                            markerEl.style.fontWeight = 'bold';
-                            markerEl.style.fontSize = '18px';
-                            markerEl.style.boxShadow = '0 2px 6px rgba(0,0,0,0.25)';
-                            markerEl.innerText = index + 1;
-                            markerEl.className = 'hotel-number-marker';
+                            // Marker and popup (as before)
+                            const el = document.createElement('div');
+                            el.style.backgroundColor = color;
+                            el.style.width = '25px';
+                            el.style.height = '25px';
+                            el.style.borderRadius = '50%';
+                            el.style.border = '2px solid white';
+                            el.style.color = 'white';
+                            el.style.textAlign = 'center';
+                            el.style.lineHeight = '22px';
+                            el.style.fontWeight = 'bold';
+                            el.innerText = index + 1;
 
-                            const hotelMarker = new mapboxgl.Marker(markerEl)
+                            const hotelMarker = new mapboxgl.Marker(el)
                                 .setLngLat(end)
                                 .addTo(this.map);
-                            this.hotelMarkers[index] = hotelMarker;
+                            this.hotelMarkers.push(hotelMarker);
 
                             const popupContent = `
                                 <div class="p-1 text-black">
@@ -429,7 +395,7 @@
                                     <hr class="my-1">
                                     <div class="text-sm">
                                         <span>Distance: ${(distance / 1000).toFixed(2)} km</span><br>
-                                        <span>${this.routeTypeLabel(routeType)}: ${Math.round(duration / 60)} min</span>
+                                        <span>🚗 ${Math.round(duration / 60)} min</span>
                                     </div>
                                 </div>
                             `;
@@ -442,7 +408,7 @@
                                 .setHTML(popupContent);
 
                             hotelMarker.setPopup(hotelPopup);
-                            this.hotelPopups[index] = hotelPopup;
+                            this.hotelPopups.push(hotelPopup);
 
                             // Collect hotel info for batch DOM update
                             if (typeof onHotelInfo === 'function') {
@@ -458,7 +424,7 @@
                     onclick="window.changeHotelRouteType(${index}, 'driving-traffic')" 
                     data-type="driving-traffic"
                     data-index="${index}"
-                    class="route-type-btn flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer border border-blue-200 bg-blue-50 hover:bg-blue-100 hover:border-blue-400 transition-colors shadow-sm"
+                    class="flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer border border-blue-200 bg-blue-50 hover:bg-blue-100 hover:border-blue-400 transition-colors shadow-sm"
                     style="min-width: 90px;"
                 >
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -473,7 +439,7 @@
                     onclick="window.changeHotelRouteType(${index}, 'walking')" 
                     data-type="walking"
                     data-index="${index}"
-                    class="route-type-btn flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer border border-green-200 bg-green-50 hover:bg-green-100 hover:border-green-400 transition-colors shadow-sm"
+                    class="flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer border border-green-200 bg-green-50 hover:bg-green-100 hover:border-green-400 transition-colors shadow-sm"
                     style="min-width: 90px;"
                 >
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -487,7 +453,7 @@
                     onclick="window.changeHotelRouteType(${index}, 'cycling')" 
                     data-type="cycling"
                     data-index="${index}"
-                    class="route-type-btn flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer border border-yellow-200 bg-yellow-50 hover:bg-yellow-100 hover:border-yellow-400 transition-colors shadow-sm"
+                    class="flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer border border-yellow-200 bg-yellow-50 hover:bg-yellow-100 hover:border-yellow-400 transition-colors shadow-sm"
                     style="min-width: 90px;"
                 >
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-yellow-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -516,23 +482,18 @@
                     },
 
                     highlightHotelRoute(index) {
+                        // Dim all routes except selected
                         Object.keys(this.hotelRoutes).forEach(i => {
                             const { routeId, color } = this.hotelRoutes[i];
                             this.map.setPaintProperty(routeId, 'line-color', i == index ? color : '#B0C4DE');
                             this.map.setPaintProperty(routeId, 'line-opacity', i == index ? 0.85 : 0.6);
-                            // Highlight marker
-                            if (this.hotelMarkers[i]) {
-                                this.hotelMarkers[i].getElement().style.boxShadow = (i == index)
-                                    ? '0 0 0 4px #fff, 0 2px 6px rgba(0,0,0,0.25)'
-                                    : '0 2px 6px rgba(0,0,0,0.25)';
-                                this.hotelMarkers[i].getElement().style.opacity = (i == index) ? '1' : '0.7';
-                            }
                         });
                         this.selectedHotelIndex = index;
                         this.updateRouteTypeButtons();
                     },
 
                     updateRouteTypeButtons() {
+                        // Highlight the selected route type button for each hotel
                         for (let i = 0; i < 5; i++) {
                             const btns = document.querySelectorAll(`#route-type-btns-${i} .route-type-btn`);
                             btns.forEach(btn => {
@@ -546,20 +507,20 @@
                     },
 
                     resetRoute() {
-                        Object.values(this.hotelRoutes).forEach(r => {
-                            if (this.map.getLayer(r.routeId)) {
-                                this.map.removeLayer(r.routeId);
+                        this.routeLayers.forEach(r => {
+                            if (this.map.getLayer(r.layer)) {
+                                this.map.removeLayer(r.layer);
                             }
-                            if (this.map.getSource(r.sourceId)) {
-                                this.map.removeSource(r.sourceId);
+                            if (this.map.getSource(r.source)) {
+                                this.map.removeSource(r.source);
                             }
                         });
-                        this.hotelRoutes = {};
+                        this.routeLayers = [];
 
-                        this.hotelMarkers.forEach(marker => marker && marker.remove());
+                        this.hotelMarkers.forEach(marker => marker.remove());
                         this.hotelMarkers = [];
 
-                        this.hotelPopups.forEach(popup => popup && popup.remove());
+                        this.hotelPopups.forEach(popup => popup.remove());
                         this.hotelPopups = [];
 
                         if (this.highlightedHotelsLayer) {
@@ -582,6 +543,7 @@
                     }
                 };
             }
+            // Expose functions for sidebar/DOM
             window.changeHotelRouteType = function(index, type) {
                 const mapbox = window.mapboxComponentInstance;
                 if (!mapbox || !mapbox.nearestHotels || !mapbox.startPoint) return;

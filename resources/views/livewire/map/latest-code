@@ -47,7 +47,6 @@
                     startPoint: null,
                     routeTypes: {},
                     markerElements: [],
-                    _pendingHotelQuery: null, // for debouncing
 
                     initMap() {
                         if (!mapboxgl.supported()) {
@@ -130,54 +129,33 @@
 
                             const coordinates = document.getElementById('coordinates');
 
-                            // --- OPTIMIZED: Only render hotels/routes after flyTo/zoom is finished ---
                             function setMarkerAndFlyTo(lng, lat, zoomLevel = 14) {
                                 marker.setLngLat([lng, lat]);
-                                coordinates.style.display = 'block';
-                                coordinates.innerHTML = `Longitude: ${toFourDecimalPlaces(lng)}<br />Latitude: ${toFourDecimalPlaces(lat)}`;
-                                setTimeout(() => {
-                                    coordinates.style.display = 'none';
-                                }, 5000);
-
-                                // Remove any pending hotel query
-                                if (this._pendingHotelQuery) {
-                                    this.map.off('moveend', this._pendingHotelQuery);
-                                    this._pendingHotelQuery = null;
-                                }
-
-                                // Only render hotels/routes after flyTo/zoom is finished
-                                this.map.flyTo({
+                                marker._map.flyTo({
                                     center: [lng, lat],
                                     zoom: zoomLevel,
                                     speed: 0.5,
                                     curve: 1.42,
                                     essential: true
                                 });
-
-                                // Debounce: Wait for moveend (flyTo finished) before rendering
-                                this._pendingHotelQuery = () => {
-                                    this.findAndRouteToNearestHotel(lng, lat);
-                                    this.map.off('moveend', this._pendingHotelQuery);
-                                    this._pendingHotelQuery = null;
-                                };
-                                this.map.on('moveend', this._pendingHotelQuery);
+                                coordinates.style.display = 'block';
+                                coordinates.innerHTML = `Longitude: ${toFourDecimalPlaces(lng)}<br />Latitude: ${toFourDecimalPlaces(lat)}`;
+                                setTimeout(() => {
+                                    coordinates.style.display = 'none';
+                                }, 5000);
                             }
 
                             function onDragEnd() {
                                 const lngLat = marker.getLngLat();
-                                setMarkerAndFlyTo.call(this, lngLat.lng, lngLat.lat, 17);
+                                setMarkerAndFlyTo(lngLat.lng, lngLat.lat, 17);
+                                this.findAndRouteToNearestHotel(lngLat.lng, lngLat.lat);
                             }
 
                             marker.on('dragend', onDragEnd.bind(this));
                         });
                     },
 
-                    // --- No change needed here, but we can add a debounce guard for safety ---
                     findAndRouteToNearestHotel(lng, lat) {
-                        // Prevent double calls if still pending
-                        if (this._isRenderingHotels) return;
-                        this._isRenderingHotels = true;
-
                         this.resetRoute();
                         const radius = 1000; // 1km
                         const overpassQuery =
@@ -199,7 +177,6 @@
                             .then(data => {
                                 if (data.elements.length === 0) {
                                     alert('No hotels found within 1km.');
-                                    this._isRenderingHotels = false;
                                     return;
                                 }
 
@@ -253,11 +230,8 @@
                                             routeInfoEl.innerHTML = '<strong class="text-base">Top 5 Nearest Hotels:</strong>' + hotelInfoHtml;
                                             this.updateRouteTypeButtons();
                                         }
-                                        this._isRenderingHotels = false;
                                     };
                                     processRoutesInParallel();
-                                } else {
-                                    this._isRenderingHotels = false;
                                 }
                             })
                             .catch(error => {
@@ -265,7 +239,6 @@
                                 alert(
                                     'Could not fetch hotel data. The Overpass API might be busy. Please try again in a moment.'
                                 );
-                                this._isRenderingHotels = false;
                             });
                     },
 
