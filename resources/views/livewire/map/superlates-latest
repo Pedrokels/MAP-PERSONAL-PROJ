@@ -47,9 +47,9 @@
                     startPoint: null,
                     routeTypes: {},
                     markerElements: [],
-                    _pendingCoords: null,
-                    _flyToInProgress: false,
-                    _routeRenderQueued: false,
+                    _pendingHotelRequest: null,
+                    _pendingFlyTo: null,
+                    _pendingFindAndRoute: null,
                     _lastDragEndCoords: null,
 
                     initMap() {
@@ -142,30 +142,27 @@
                                 };
                             }
 
-                            // --- Only render routes after flyTo/zoom/move is finished and map is idle ---
-                            let flyToInProgress = false;
+                            // --- Delayed findAndRouteToNearestHotel after flyTo/zoomend ---
+                            let pendingFindAndRoute = null;
                             let pendingCoords = null;
-                            let renderQueued = false;
+                            let flyToInProgress = false;
+                            let flyToTarget = null;
 
-                            // Use requestIdleCallback if available, fallback to setTimeout
-                            function runWhenIdle(cb) {
-                                if ('requestIdleCallback' in window) {
-                                    window.requestIdleCallback(cb, { timeout: 500 });
-                                } else {
-                                    setTimeout(cb, 50);
-                                }
-                            }
-
+                            // This will be called after dragend, but will only trigger findAndRoute after flyTo and zoomend
                             function setMarkerAndFlyTo(lng, lat, zoomLevel = 14) {
                                 marker.setLngLat([lng, lat]);
                                 flyToInProgress = true;
-                                pendingCoords = { lng, lat };
+                                flyToTarget = { lng, lat, zoom: zoomLevel };
                                 coordinates.style.display = 'block';
                                 coordinates.innerHTML = `Longitude: ${toFourDecimalPlaces(lng)}<br />Latitude: ${toFourDecimalPlaces(lat)}`;
                                 setTimeout(() => {
                                     coordinates.style.display = 'none';
                                 }, 5000);
 
+                                // Save the coords for later use
+                                pendingCoords = { lng, lat };
+
+                                // Start flyTo
                                 marker._map.flyTo({
                                     center: [lng, lat],
                                     zoom: zoomLevel,
@@ -177,20 +174,22 @@
 
                             // Debounced handler to avoid multiple triggers
                             const debouncedFindAndRoute = debounce((lng, lat) => {
+                                // Only run if not currently flying
                                 if (!flyToInProgress) {
-                                    this.queueRouteRender(lng, lat);
+                                    this.findAndRouteToNearestHotel(lng, lat);
                                 }
                             }, 200);
 
-                            // Listen for moveend to trigger route rendering
+                            // Listen for flyend and zoomend to trigger findAndRoute
                             this.map.on('moveend', () => {
+                                // If we just finished a flyTo, trigger findAndRoute
                                 if (flyToInProgress && pendingCoords) {
-                                    flyToInProgress = false;
-                                    // Use idle callback to avoid blocking UI
-                                    runWhenIdle(() => {
-                                        this.queueRouteRender(pendingCoords.lng, pendingCoords.lat);
+                                    // Wait a bit to ensure map is stable
+                                    setTimeout(() => {
+                                        flyToInProgress = false;
+                                        this.findAndRouteToNearestHotel(pendingCoords.lng, pendingCoords.lat);
                                         pendingCoords = null;
-                                    });
+                                    }, 100); // small delay for smoothness
                                 }
                             });
 
@@ -204,22 +203,6 @@
 
                             marker.on('dragend', onDragEnd.bind(this));
                         });
-                    },
-
-                    // Queue route rendering to avoid blocking UI
-                    queueRouteRender(lng, lat) {
-                        if (this._routeRenderQueued) return;
-                        this._routeRenderQueued = true;
-                        // Use requestIdleCallback or setTimeout to defer heavy work
-                        const doRender = () => {
-                            this._routeRenderQueued = false;
-                            this.findAndRouteToNearestHotel(lng, lat);
-                        };
-                        if ('requestIdleCallback' in window) {
-                            window.requestIdleCallback(doRender, { timeout: 500 });
-                        } else {
-                            setTimeout(doRender, 50);
-                        }
                     },
 
                     findAndRouteToNearestHotel(lng, lat) {
@@ -280,7 +263,6 @@
                                     this.highlightHotelBuildings(nearestHotels, data.elements);
 
                                     // --- Optimization: Batch fetch all routes in parallel and update map in one go ---
-                                    // Use requestIdleCallback to avoid blocking UI
                                     const processRoutesInParallel = async () => {
                                         let hotelInfoHtml = '';
                                         const routePromises = [];
@@ -293,20 +275,13 @@
                                             );
                                         }
                                         await Promise.all(routePromises);
-                                        // Defer DOM update to next frame for smoothness
-                                        requestAnimationFrame(() => {
-                                            const routeInfoEl = document.getElementById('route-info');
-                                            if (routeInfoEl) {
-                                                routeInfoEl.innerHTML = '<strong class="text-base">Top 5 Nearest Hotels:</strong>' + hotelInfoHtml;
-                                                this.updateRouteTypeButtons();
-                                            }
-                                        });
+                                        const routeInfoEl = document.getElementById('route-info');
+                                        if (routeInfoEl) {
+                                            routeInfoEl.innerHTML = '<strong class="text-base">Top 5 Nearest Hotels:</strong>' + hotelInfoHtml;
+                                            this.updateRouteTypeButtons();
+                                        }
                                     };
-                                    if ('requestIdleCallback' in window) {
-                                        window.requestIdleCallback(processRoutesInParallel, { timeout: 500 });
-                                    } else {
-                                        setTimeout(processRoutesInParallel, 50);
-                                    }
+                                    processRoutesInParallel();
                                 }
                             })
                             .catch(error => {
@@ -411,14 +386,6 @@
                         const directionsUrl =
                             `https://api.mapbox.com/directions/v5/mapbox/${routeType}/${start.join(',')};${end.join(',')}?geometries=geojson&overview=full&access_token=${mapboxgl.accessToken}`;
                         try {
-                            // Defer heavy fetch to idle time for smoothness
-                            await new Promise(resolve => {
-                                if ('requestIdleCallback' in window) {
-                                    window.requestIdleCallback(resolve, { timeout: 500 });
-                                } else {
-                                    setTimeout(resolve, 30);
-                                }
-                            });
                             const response = await fetch(directionsUrl);
                             const routeData = await response.json();
                             if (!routeData.routes || routeData.routes.length === 0) {
@@ -430,8 +397,7 @@
                             const duration = routeData.routes[0].duration;
                             const routeId = `route-${index}`;
                             const routeSourceId = `route-source-${index}`;
-                            // Add route as a layer, but defer to next frame for smoothness
-                            await new Promise(resolve => requestAnimationFrame(resolve));
+                            // Add route as a layer
                             this.map.addSource(routeSourceId, {
                                 type: 'geojson',
                                 data: {
@@ -478,8 +444,6 @@
                             markerEl.innerText = index + 1;
                             markerEl.className = 'hotel-number-marker';
 
-                            // Defer marker creation to next frame for smoothness
-                            await new Promise(resolve => requestAnimationFrame(resolve));
                             const hotelMarker = new mapboxgl.Marker(markerEl)
                                 .setLngLat(end)
                                 .addTo(this.map);
